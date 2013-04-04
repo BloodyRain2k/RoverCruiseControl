@@ -31,7 +31,7 @@ public class RoverCruiseControlAttacher : UnityEngine.MonoBehaviour {
 	private Vessel last;
 	
 	public void Update() {
-		if (!HighLogic.LoadedSceneIsFlight) {
+		if (!HighLogic.LoadedSceneIsFlight || FlightGlobals.fetch == null) {
 			return;
 		}
 		
@@ -64,8 +64,11 @@ public class RoverCruiseControl : PartModule {
 	public bool Wheels = false;
 	public float upperSpeedLimit = 0;
 	public float lowerSpeedLimit = 1000;
+	public float upperTorqueLimit = 0;
+	public float lowerTorqueLimit = 1000;
 	private int parts;
 	private List<RoverCruiseControl> controllers = new List<RoverCruiseControl>();
+	private List<ModuleEngines> engines = new List<ModuleEngines>();
 	
 	[KSPEvent(guiActive = false, guiName = "Activate Cruise Control", active = true)]
 	public void Activate() {
@@ -95,8 +98,8 @@ public class RoverCruiseControl : PartModule {
 		Deactivate();
 	}
 	
-	public void ChangeState(bool NowActive) {
-		Active = NowActive;
+	public void ChangeState(bool nowActive) {
+		Active = nowActive;
 		Events["Activate"].active = !Active;
 		Events["Deactivate"].active = Active;
 	}
@@ -105,10 +108,39 @@ public class RoverCruiseControl : PartModule {
 		controllers.ForEach(c => c.ChangeState(Active));
 	}
 	
+	private float ActiveThrust() {
+		float thrust = 0;
+		foreach (ModuleEngines e in engines) {
+			if (e.getIgnitionState && !e.getFlameoutState) {
+				thrust += e.maxThrust;
+			}
+		}
+		return thrust;
+	}
+	
+	private void ThrottleEngine(ModuleEngines engine, float throttle) {
+		if (engine.useEngineResponseTime)
+		{
+			if (engine.currentThrottle < throttle)
+			{
+				engine.currentThrottle = Mathf.Lerp(engine.currentThrottle, throttle, engine.engineAccelerationSpeed * TimeWarp.fixedDeltaTime);
+			}
+			else
+			{
+				engine.currentThrottle = Mathf.Lerp(engine.currentThrottle, throttle, engine.engineDecelerationSpeed * TimeWarp.fixedDeltaTime);
+			}
+		}
+		else
+		{
+			engine.currentThrottle = throttle;
+		}
+	}
+	
 	private void ScanVessel() {
 		controllers.Clear();
-		upperSpeedLimit = 0;
-		lowerSpeedLimit = 1000;
+		engines.Clear();
+		upperTorqueLimit = upperSpeedLimit = 0;
+		lowerTorqueLimit = lowerSpeedLimit = 1000;
 		parts = vessel.Parts.Count;
 		Wheels = false;
 		
@@ -118,12 +150,17 @@ public class RoverCruiseControl : PartModule {
 					var wheel = (ModuleWheel)pm;
 					float speed = FindTorque(wheel);
 //					print("Speed: " + speed);
-					upperSpeedLimit = Mathf.Max(upperSpeedLimit, speed);
-					lowerSpeedLimit = Mathf.Min(lowerSpeedLimit, speed);
+					upperTorqueLimit = Mathf.Max(upperTorqueLimit, speed);
+					lowerTorqueLimit = Mathf.Min(lowerTorqueLimit, speed);
+					upperSpeedLimit = Mathf.Max(upperSpeedLimit, wheel.overSpeedDamage);
+					lowerSpeedLimit = Mathf.Min(lowerSpeedLimit, wheel.overSpeedDamage);
 					Wheels = true;
 				}
 				else if (pm is RoverCruiseControl) {
 					controllers.Add((RoverCruiseControl)pm);
+				}
+				else if (pm is ModuleEngines) {
+					engines.Add((ModuleEngines)pm);
 				}
 			}
 		}
@@ -200,7 +237,7 @@ public class RoverCruiseControl : PartModule {
 			Toggle(null);
 			if (Active) {
 				var speed = (float)vessel.horizontalSrfSpeed;
-				FlightInputHandler.state.mainThrottle = speed / upperSpeedLimit;
+				FlightInputHandler.state.mainThrottle = speed / (ActiveThrust() > 0 ? upperSpeedLimit : upperTorqueLimit);
 			}
 		}
 	}
@@ -211,7 +248,11 @@ public class RoverCruiseControl : PartModule {
 		var speed = (float)vessel.horizontalSrfSpeed;
 
 		if (fs.wheelThrottle == 0) {
-			var diff = ((upperSpeedLimit * fs.mainThrottle) - speed);
+			var diff = (((ActiveThrust() > 0 ? upperSpeedLimit : upperTorqueLimit) * fs.mainThrottle) - speed);
+			var throttle = Mathf.Clamp(diff / 125, 0, 1) + (fs.mainThrottle > 0 ? 0.01f : 0);
+			foreach(var e in engines) {
+				ThrottleEngine(e, throttle);
+			}
 			fs.wheelThrottle = Mathf.Clamp(diff * 5, 0, 1);
 			vessel.ActionGroups.SetGroup(KSPActionGroup.Brakes, diff <= 0 || GameSettings.BRAKES.GetKey());
 		} else {
